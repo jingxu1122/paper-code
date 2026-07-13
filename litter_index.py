@@ -1,32 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 =====================================================================
- 芦苇立枯物指数（LSDI）构建与验证 —— 整合流程
-=====================================================================
-本脚本由以下两份原始代码重新整理合并而成：
-  · main_15_efast_lhs_v6_SG_6.py   → PROSAIL模拟 / 敏感性分析 / 光谱预处理
-  · litter_index_rf_3band.py       → LSDI指数构建 / 混淆矩阵 / 随机森林
-
-整理原则：
-  - 只保留研究流程主线所需的计算与关键图表，去除了与传感器波段
-    重采样（Sentinel-2/Landsat）等旁支相关、与主线不直接相关的内容；
-  - 每一步均可独立运行/调试，中间结果通过 dict/DataFrame 传递；
-  - 所有绘图函数集中在每个 Step 末尾，便于统一风格管理。
-
-流程总览（对应本文件中的 STEP 1~10）：
-  STEP 1   读取实测数据
-             (a) 6个覆盖度梯度的“代表光谱”（用于 PROSAIL 精度验证 / 敏感性分析）
-             (b) 90条逐条实测光谱（用于 LSDI 构建 / 随机森林分类）
-  STEP 2   PROSAIL 冠层光谱模拟（拉丁超立方采样 LHS，每个覆盖度 N_SAMPLES 次）
-  STEP 3   精度筛选：逐样本计算模拟 vs 实测的 R²，仅保留 R² ≥ 0.95 的模拟样本
-  STEP 4   光谱响应预处理：原始反射率 / 一阶导数 / 二阶导数
-  STEP 5   Savitzky-Golay (SG) 滤波参数筛选（多组合窗口/阶数对比，确定最优参数）
-  STEP 6   OAT（One-At-a-Time）局部敏感性分析
-  STEP 7   EFAST（扩展傅里叶幅度检验）全局敏感性分析
-  STEP 8   构建立枯物指数 LSDI（三波段 LOO-CV 嵌套搜索）
-  STEP 9   LSDI 与 7 个常规植被指数（NDVI/GRNDVI/GDVI/MSAVI/ARVI/WDRVI/EVI）
-             的二分类混淆矩阵对比
-  STEP 10  随机森林二分类结果汇总（准确率对比图 + 结果表 CSV）
+ 芦苇立枯物指数（LSDI）构建与验证
 =====================================================================
 """
 
@@ -92,17 +67,12 @@ matplotlib.rcParams['figure.dpi']          = 150
 
 
 # =====================================================================
-# CONFIG —— 请根据实际路径修改
+# CONFIG
 # =====================================================================
 BASE_DIR = Path(__file__).parent
 
-# (a) 6个覆盖度“代表光谱”数据（宽表：波段列 + 6个覆盖度列）
 XLSX_MEAN_PATH = BASE_DIR / '20190521lu.xlsx'
-
-# (b) 90条逐条实测光谱数据（宽表：波段列 + 90个样本列，列名编码覆盖度）
 XLSX_SAMPLES_PATH = BASE_DIR / '201905.xlsx'
-
-# PROSAIL模拟结果导出（如果已有，可直接读取跳过 STEP 2，与 litter_index_rf_3band.py 对接）
 SIM_EXPORT_PKL = BASE_DIR / 'sim_data_export.pkl'
 
 OUT_DIR = BASE_DIR / 'results'
@@ -112,9 +82,9 @@ ALL_COVERAGES = [0, 20, 40, 60, 80, 100]
 COL_MAP = {0: 'Litter_0%', 20: 'Litter_20%', 40: 'Litter_40%',
            60: 'Litter_60%', 80: 'Litter_80%', 100: 'Litter_100%'}
 
-N_SAMPLES   = 2000            # 每个覆盖度 LHS 采样数
+N_SAMPLES   = 2000            
 PARAM_NAMES = ['n', 'cab', 'car', 'cbrown', 'cw', 'cm', 'prot', 'cbc', 'lai']
-R2_THRESHOLD = 0.95            # STEP 3 精度筛选阈值
+R2_THRESHOLD = 0.95           
 
 COLORS = [
     (0.13, 0.55, 0.13), (0.60, 0.76, 0.20), (0.93, 0.78, 0.05),
@@ -126,13 +96,13 @@ GEO = dict(
     prospect_version='PRO', rsoil=1.0, psoil=0.85,
 )
 
-# lidfa（平均叶倾角）采样范围：随覆盖度线性插值
+# lidfa（平均叶倾角）采样范围
 LIDFA_RANGE = {
     0:   (40, 70),  20:  (39, 72),  40:  (38, 74),
     60:  (37, 76),  80:  (36, 78), 100:  (35, 80),
 }
 
-# PROSPECT-PRO + 4SAIL 各覆盖度参数先验范围
+# PROSPECT-PRO + 4SAIL 各覆盖度参数范围
 TABLE1 = {
     0:   dict(n=(1.5, 2.5),    cab=(15.0, 70.0), car=(1.5, 20.0), cbrown=(0.0, 0.0),
               cw=(0.01, 0.05), cm=(0.005, 0.010), prot=(0.0015, 0.0020), cbc=(0.0035, 0.007),  lai=(0.9, 2.5)),
@@ -156,12 +126,9 @@ _SLICE = slice(0, 501)   # 400-900nm，501个波段
 # =====================================================================
 
 def step1_read_measured_mean(xlsx_path):
-    """
-    读取 6 个覆盖度梯度的代表光谱（宽表：第一列为波段nm，其余列为 Litter_X% ）
-    用于：PROSAIL 精度验证 / OAT / EFAST 敏感性分析
-    """
+
     print("\n" + "=" * 62)
-    print("  STEP 1(a)  读取实测数据 —— 6组覆盖度代表光谱")
+    print("  STEP 1(a)  读取实测数据")
     print("=" * 62)
 
     df = pd.read_excel(xlsx_path, sheet_name='Sheet1', header=0)
@@ -176,19 +143,9 @@ def step1_read_measured_mean(xlsx_path):
 
 
 def step1_read_measured_samples(xlsx_path, wl_ref):
-    """
-    读取 90 条逐条实测光谱（波段400~900nm，覆盖度梯度100/80/60/40/20/0%）
-    列名规则：
-      1, 1.1, 1.2, ...       → 100%
-      0.8, 0.8.1, ...        → 80%
-      0.6, 0.6.1, ...        → 60%
-      0.4, 0.4.1, ...        → 40%
-      0.2, 0.2.1, ...        → 20%
-      0,   0.1,   0.2, ...   → 0%
-    用于：LSDI 构建（LOO-CV） / 随机森林二分类测试
-    """
+   
     print("\n" + "=" * 62)
-    print("  STEP 1(b)  读取实测数据 —— 90条逐条光谱（用于LSDI构建/分类）")
+    print("  STEP 1(b)  读取实测数据 ")
     print("=" * 62)
 
     df_raw = pd.read_excel(xlsx_path, sheet_name='Sheet1')
@@ -250,7 +207,6 @@ def run_prosail_once(params: dict, lidfa: float = None) -> np.ndarray:
 
 
 def step2_prosail_simulation(wl):
-    """对每个覆盖度做 LHS 采样 + PROSAIL 模拟，返回 sim_data[cov] = dict(all, pmat, ...)"""
     print("\n" + "=" * 62)
     print(f"  STEP 2  PROSAIL冠层光谱模拟（LHS采样，每个覆盖度 {N_SAMPLES} 次）")
     print("=" * 62)
@@ -314,17 +270,11 @@ def spectral_metrics(meas, sim, vis_mask, nir_mask):
 
 
 # =====================================================================
-# STEP 3  精度筛选（逐样本 R² ≥ 0.95）
+# STEP 3  精度筛选
 # =====================================================================
 
 def step3_accuracy_filter(wl, measured_mean, sim_data, out_dir=OUT_DIR):
-    """
-    对每个覆盖度：
-      1) 计算筛选前均值光谱精度（基准）
-      2) 逐条模拟光谱与实测计算 R²，保留 R² >= R2_THRESHOLD 的样本
-      3) 更新 sim_data 为筛选后的子集，并计算筛选后精度
-    返回：更新后的 sim_data（就地更新）、acc_before、acc_after、filter_stats
-    """
+   
     print("\n" + "=" * 62)
     print(f"  STEP 3  精度筛选（NSE-R² ≥ {R2_THRESHOLD}）")
     print("=" * 62)
@@ -413,15 +363,11 @@ def step3_accuracy_filter(wl, measured_mean, sim_data, out_dir=OUT_DIR):
 
 
 # =====================================================================
-# STEP 4  光谱响应预处理：原始反射率 / 一阶导数 / 二阶导数
+# STEP 4  光谱响应预处理
 # =====================================================================
 
 def spectral_transform(spec, wl, order=0, sg_win=11, sg_poly=3):
-    """
-    order=0: 原始反射率
-    order=1: 一阶导数（中心差分）
-    order=2: 二阶导数（先SG平滑，再两次差分；SG参数由 STEP 5 确认）
-    """
+   
     if order == 0:
         return spec.astype(float)
     if order == 1:
@@ -436,7 +382,6 @@ def spectral_transform(spec, wl, order=0, sg_win=11, sg_poly=3):
 
 def step4_spectral_response(wl, measured_mean, sim_data, out_dir=OUT_DIR,
                              sg_win=11, sg_poly=3, n_draw=50):
-    """绘制 原始反射率 / 一阶导数 / 二阶导数 三张对比图（低立枯物 vs 高立枯物）"""
     print("\n" + "=" * 62)
     print("  STEP 4  光谱响应预处理（原始 / 一阶导数 / 二阶导数）")
     print("=" * 62)
@@ -737,17 +682,7 @@ def step7_efast_sensitivity(wl, efast_n=2000, out_dir=OUT_DIR):
 
 
 # =====================================================================
-# STEP 8  构建立枯物指数 LSDI（三波段 LOO-CV 嵌套搜索）
-# =====================================================================
-#
-#   LSDI = (ρ_B1 - ρ_B2) / (ρ_B1 + ρ_B2 + ρ_B3)
-#
-#   外层 LOO（共90折）：留出第 i 条
-#     内层：仅用剩余89条
-#       Step A：搜索最优波段对 (B1,B2) —— 使 (B1-B2)/(|B1|+|B2|) 与覆盖度 Spearman|ρ| 最大
-#       Step B：固定 B1/B2，搜索最优 B3 —— 使 LSDI 与覆盖度 Spearman|ρ| 最大
-#       训练随机森林（二分类）→ 预测第 i 条
-#   汇总 → LOO 准确率 + 波段稳定性统计
+# STEP 8  构建立枯物指数 LSDI
 # =====================================================================
 
 SEARCH_RANGE = (440, 780)   # 候选波段搜索范围 (nm)
@@ -798,7 +733,7 @@ def _find_best_b3(spec_mat, cov_vals, wl, ia, ib, candidate_idx, min_sep=MIN_SEP
 def step8_build_lsdi(wl, X_meas, y_meas_cov, y_meas_bin, sg_win=9, sg_poly=3, out_dir=OUT_DIR):
     """三波段 LOO-CV 嵌套搜索，构建 LSDI 指数并返回 LOO 预测结果、最终波段组合"""
     print("\n" + "=" * 62)
-    print("  STEP 8  构建立枯物指数 LSDI（三波段 LOO-CV 嵌套搜索，共90折）")
+    print("  STEP 8  构建立枯物指数 LSDI")
     print("=" * 62)
     print("  指数：LSDI = (ρ_B1 - ρ_B2) / (ρ_B1 + ρ_B2 + ρ_B3)")
     print(f"  搜索范围：{SEARCH_RANGE[0]}~{SEARCH_RANGE[1]} nm，最小波段间隔 {MIN_SEP} nm\n")
@@ -932,11 +867,6 @@ def calc_base_vi(spec_mat, wl):
 
 
 def step9_confusion_matrices(wl, X_meas, y_meas_bin, sim_data, lsdi_result, out_dir=OUT_DIR):
-    """
-    常规VI：PROSAIL（筛选后）训练随机森林 → 90条实测测试
-    LSDI  ：使用 STEP 8 的 LOO-CV 预测结果
-    绘制 LSDI + 7个常规指数 共8张混淆矩阵（同一网格图）
-    """
     print("\n" + "=" * 62)
     print("  STEP 9  LSDI 与 7个常规指数的二分类混淆矩阵对比")
     print("=" * 62)
@@ -1007,7 +937,6 @@ def step9_confusion_matrices(wl, X_meas, y_meas_bin, sim_data, lsdi_result, out_
 # =====================================================================
 
 def step10_summary(lsdi_result, base_results, n_samples, out_dir=OUT_DIR):
-    """汇总 LSDI(LOO-CV) 与 7个常规VI(PROSAIL训练→实测测试) 的分类准确率，输出对比图与CSV"""
     print("\n" + "=" * 62)
     print("  STEP 10  随机森林二分类结果汇总")
     print("=" * 62)
@@ -1089,7 +1018,6 @@ def main():
 
     # ---- STEP 2  PROSAIL 模拟 ----
     if SIM_EXPORT_PKL.exists():
-        # 若已有导出的模拟结果（例如来自单独的批处理任务），可直接加载，跳过重新模拟
         print(f"\n检测到已有模拟结果 {SIM_EXPORT_PKL.name}，直接加载...")
         with open(SIM_EXPORT_PKL, 'rb') as f:
             export = pickle.load(f)
