@@ -156,22 +156,39 @@ def step1_read_measured_samples(xlsx_path, wl_ref):
     assert np.allclose(wl, wl_ref, atol=0.5), \
         f"波段不一致！samples={wl[0]}~{wl[-1]}，mean_spec={wl_ref[0]}~{wl_ref[-1]}"
 
-    cov_map = {'1': 100, '0.8': 80, '0.6': 60, '0.4': 40, '0.2': 20, '0': 0}
+    # 列名形如 100%_1、80%_2。按原始表头、按列位置读取，避免重名被改写。
+    from openpyxl import load_workbook
+    wb = load_workbook(xlsx_path, read_only=True, data_only=True)
+    headers = next(wb['Sheet1'].iter_rows(min_row=1, max_row=1, values_only=True))
+    wb.close()
+    cov_by_value = {1.0: 100, 0.8: 80, 0.6: 60, 0.4: 40, 0.2: 20, 0.0: 0}
 
-    def parse_cov(col_name):
-        parts = str(col_name).split('.')
-        if len(parts) == 1:
-            return cov_map.get(parts[0])
-        prefix2 = parts[0] + '.' + parts[1]
-        return cov_map[prefix2] if prefix2 in cov_map else cov_map.get(parts[0])
+    def parse_cov(value):
+        if value is None:
+            return None
+        text = str(value).strip().replace('覆盖度', '')
+        if '%' in text:
+            head = text.split('%', 1)[0]
+            try:
+                return int(round(float(head)))
+            except ValueError:
+                return None
+        try:
+            number = round(float(text), 1)
+        except ValueError:
+            return None
+        return cov_by_value.get(number)
 
-    spec_cols = [c for c in df.columns if c != '波段nm']
-    cov_labels = [parse_cov(c) for c in spec_cols]
-    valid_pairs = [(c, lbl) for c, lbl in zip(spec_cols, cov_labels) if lbl is not None]
-    spec_cols = [p[0] for p in valid_pairs]
-    cov_labels = [p[1] for p in valid_pairs]
+    valid_pairs = []
+    for i, header in enumerate(headers):
+        if i == 0:
+            continue
+        cov = parse_cov(header)
+        if cov is not None:
+            valid_pairs.append((i, cov))
 
-    X_meas = np.array([df[c].values.astype(float) for c in spec_cols])   # (90, 501)
+    X_meas = np.array([df.iloc[:, i].to_numpy(dtype=float) for i, _ in valid_pairs])
+    cov_labels = [cov for _, cov in valid_pairs]
     y_meas_cov = np.array(cov_labels)
     y_meas_bin = (y_meas_cov >= 60).astype(int)                          # 二分类：高(>=60%) / 低(<60%)
 
@@ -270,13 +287,13 @@ def spectral_metrics(meas, sim, vis_mask, nir_mask):
 
 
 # =====================================================================
-# STEP 3  精度筛选
+# STEP 3  模拟光谱与实测均值的 R²
 # =====================================================================
 
 def step3_accuracy_filter(wl, measured_mean, sim_data, out_dir=OUT_DIR):
    
     print("\n" + "=" * 62)
-    print(f"  STEP 3  精度筛选（NSE-R² ≥ {R2_THRESHOLD}）")
+    print(f"  STEP 3  模拟光谱与实测均值（NSE-R² ≥ {R2_THRESHOLD}）")
     print("=" * 62)
 
     vis_mask = (wl >= 400) & (wl <= 700)
@@ -285,7 +302,7 @@ def step3_accuracy_filter(wl, measured_mean, sim_data, out_dir=OUT_DIR):
     acc_before = {cov: spectral_metrics(measured_mean[cov], sim_data[cov]['all'].mean(0), vis_mask, nir_mask)
                   for cov in ALL_COVERAGES}
 
-    print(f"\n  筛选前均值光谱精度（全部 {N_SAMPLES} 条模拟样本）:")
+    print(f"\n  全部 {N_SAMPLES} 条模拟光谱的均值:")
     for cov in ALL_COVERAGES:
         m = acc_before[cov]
         print(f"  {cov:4d}%  R²={m['R2']:.4f}  RMSE={m['RMSE']:.5f}  SAM={m['SAM']:.3f}°")
@@ -328,12 +345,12 @@ def step3_accuracy_filter(wl, measured_mean, sim_data, out_dir=OUT_DIR):
     acc_after = {cov: spectral_metrics(measured_mean[cov], sim_data[cov]['mean'], vis_mask, nir_mask)
                  for cov in ALL_COVERAGES}
 
-    print(f"\n  筛选后均值光谱精度（R²≥{R2_THRESHOLD} 保留样本）:")
+    print(f"\n  R²≥{R2_THRESHOLD} 的模拟光谱均值:")
     for cov in ALL_COVERAGES:
         m = acc_after[cov]
         print(f"  {cov:4d}%  R²={m['R2']:.4f}  RMSE={m['RMSE']:.5f}  SAM={m['SAM']:.3f}°")
 
-    # ── 筛选前后精度对比图 ──
+    # ── 均值光谱 R²、RMSE、SAM ──
     fig, axes = plt.subplots(1, 3, figsize=(7.0, 2.4), gridspec_kw={'wspace': 0.40})
     labels = [f'{c}%' for c in ALL_COVERAGES]
     x = np.arange(len(ALL_COVERAGES)); w = 0.35
@@ -414,7 +431,8 @@ def step4_spectral_response(wl, measured_mean, sim_data, out_dir=OUT_DIR,
             ax.plot(wl_plot, d, color='darkorange', alpha=0.75, lw=1.4, zorder=5)
 
     def _make_figure(order, ylabel, fname, panel_b_range, panel_b_title,
-                      panel_c_range, panel_c_title, mark_rededge=True):
+                      panel_c_range, panel_c_title, mark_rededge=True,
+                      panel_labels=('(a)', '(b)', '(c)')):
         fig = plt.figure(figsize=(7.0, 4.5))
         gs = gridspec.GridSpec(2, 2, figure=fig, height_ratios=[1.2, 1], hspace=0.35, wspace=0.30)
 
@@ -424,10 +442,10 @@ def step4_spectral_response(wl, measured_mean, sim_data, out_dir=OUT_DIR,
             Line2D([0], [0], color='black', lw=1.5, label='Low litter (0–20%)'),
             Line2D([0], [0], color='darkorange', lw=1.5, label='High litter (80–100%)'),
         ]
-        ax_a.legend(handles=legend_lines, fontsize=9, loc='center right',
-                    bbox_to_anchor=(1.0, 0.65), framealpha=0.8)
+        ax_a.legend(handles=legend_lines, fontsize=9, loc='upper left',
+                    bbox_to_anchor=(0.02, 0.98), framealpha=0.8)
         ax_a.set_xlabel('Wavelength (nm)', fontsize=9); ax_a.set_ylabel(ylabel, fontsize=9)
-        ax_a.set_title(f'(a) {ylabel} (400–900 nm)', fontsize=9)
+        ax_a.set_title(f'{panel_labels[0]} {ylabel} (400–900 nm)', fontsize=9)
         ax_a.set_xlim(400, 900); ax_a.grid(True, alpha=0.3)
         if mark_rededge:
             ax_a.axvspan(700, 780, color='red', alpha=0.05)
@@ -437,13 +455,13 @@ def step4_spectral_response(wl, measured_mean, sim_data, out_dir=OUT_DIR,
         mask_b = (wl >= panel_b_range[0]) & (wl <= panel_b_range[1])
         _plot_panel(ax_b, mask_b, order)
         ax_b.set_xlabel('Wavelength (nm)', fontsize=9); ax_b.set_ylabel(ylabel, fontsize=9)
-        ax_b.set_title(f'(b) {panel_b_title}', fontsize=9); ax_b.grid(True, alpha=0.3)
+        ax_b.set_title(f'{panel_labels[1]} {panel_b_title}', fontsize=9); ax_b.grid(True, alpha=0.3)
 
         ax_c = fig.add_subplot(gs[1, 1])
         mask_c = (wl >= panel_c_range[0]) & (wl <= panel_c_range[1])
         _plot_panel(ax_c, mask_c, order)
         ax_c.set_xlabel('Wavelength (nm)', fontsize=9); ax_c.set_ylabel(ylabel, fontsize=9)
-        ax_c.set_title(f'(c) {panel_c_title}', fontsize=9); ax_c.grid(True, alpha=0.3)
+        ax_c.set_title(f'{panel_labels[2]} {panel_c_title}', fontsize=9); ax_c.grid(True, alpha=0.3)
 
         plt.tight_layout()
         fig.savefig(out_dir / fname, dpi=400, bbox_inches='tight')
@@ -453,13 +471,15 @@ def step4_spectral_response(wl, measured_mean, sim_data, out_dir=OUT_DIR,
     _make_figure(0, 'Reflectance', 'step4_reflectance_spectra.png',
                  (400, 750), 'VIS region', (750, 900), 'NIR plateau', mark_rededge=False)
     _make_figure(1, 'First derivative reflectance', 'step4_first_derivative_spectra.png',
-                 (680, 780), 'Red-edge region (zoom)', (750, 900), 'NIR plateau')
+                 (680, 780), 'Red-edge region (zoom)', (750, 900), 'NIR plateau',
+                 panel_labels=('(d)', '(e)', '(f)'))
     _make_figure(2, 'Second derivative reflectance', 'step4_second_derivative_spectra.png',
-                 (680, 780), 'Red-edge region (zoom)', (750, 900), 'NIR plateau')
+                 (680, 780), 'Red-edge region (zoom)', (750, 900), 'NIR plateau',
+                 panel_labels=('(g)', '(h)', '(i)'))
 
 
 # =====================================================================
-# STEP 5  SG（Savitzky-Golay）滤波参数筛选
+# STEP 5  SG（Savitzky-Golay）窗口与多项式阶数
 # =====================================================================
 
 SG_COMBOS = [
@@ -485,7 +505,7 @@ def step5_sg_selection(wl, test_spectrum, out_dir=OUT_DIR):
     返回：推荐的 (win, poly)
     """
     print("\n" + "=" * 62)
-    print("  STEP 5  SG滤波参数筛选（多组合窗口/阶数对比）")
+    print("  STEP 5  SG窗口与多项式阶数")
     print("=" * 62)
 
     _wl = wl.astype(float)
@@ -584,8 +604,10 @@ def step6_oat_sensitivity(wl, out_dir=OUT_DIR):
         ax.yaxis.grid(True, lw=0.35, color='0.88', zorder=0); ax.set_axisbelow(True)
         ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
         if ax is axes.flat[0]:
-            ax.legend(fontsize=5.8, loc='upper right', ncol=2, handlelength=1.0,
-                      borderpad=0.3, columnspacing=0.4)
+            # 单列竖排窄图例，贴右上角，不遮挡曲线
+            ax.legend(fontsize=5.0, loc='upper right', bbox_to_anchor=(0.99, 0.99),
+                      ncol=1, handlelength=1.2, borderpad=0.3,
+                      labelspacing=0.25, handletextpad=0.5)
     plt.tight_layout(pad=0.5)
     fig.savefig(out_dir / 'step6_OAT_sensitivity.png', dpi=400, bbox_inches='tight')
     plt.close()
@@ -671,8 +693,10 @@ def step7_efast_sensitivity(wl, efast_n=2000, out_dir=OUT_DIR):
             ax.yaxis.grid(True, lw=0.35, color='0.88', zorder=0); ax.set_axisbelow(True)
             ax.spines['top'].set_visible(False); ax.spines['right'].set_visible(False)
             if ax is axes.flat[0]:
-                ax.legend(fontsize=5.8, loc='upper right', ncol=2, handlelength=1.0,
-                          borderpad=0.3, columnspacing=0.4)
+                # 单列竖排窄图例，贴右上角，不遮挡曲线
+                ax.legend(fontsize=5.0, loc='upper right', bbox_to_anchor=(0.99, 0.99),
+                          ncol=1, handlelength=1.2, borderpad=0.3,
+                          labelspacing=0.25, handletextpad=0.5)
         plt.tight_layout(pad=0.5)
         fig.savefig(out_dir / fname, dpi=400, bbox_inches='tight')
         plt.close()
@@ -685,7 +709,7 @@ def step7_efast_sensitivity(wl, efast_n=2000, out_dir=OUT_DIR):
 # STEP 8  构建立枯物指数 LSDI
 # =====================================================================
 
-SEARCH_RANGE = (440, 780)   # 候选波段搜索范围 (nm)
+SEARCH_RANGE = (440, 780)   # 波段范围 (nm)
 MIN_SEP = 20                # 最小波段间隔 (nm)
 
 
@@ -774,7 +798,7 @@ def step8_build_lsdi(wl, X_meas, y_meas_cov, y_meas_bin, sg_win=9, sg_poly=3, ou
     # ── 波段稳定性统计 ──
     cnt_all = Counter(band_log)
     top_combo = cnt_all.most_common(1)[0][0]
-    print(f"\n最终指数波段定义（最高频三波段组合）:")
+    print(f"\n最终指数波段定义（出现次数最多的三波段）:")
     print(f"  B1={top_combo[0]}nm  B2={top_combo[1]}nm  B3={top_combo[2]}nm")
     print(f"  LSDI = (ρ_{top_combo[0]} - ρ_{top_combo[1]}) / (ρ_{top_combo[0]} + ρ_{top_combo[1]} + ρ_{top_combo[2]})")
 
@@ -843,7 +867,7 @@ def step8_build_lsdi(wl, X_meas, y_meas_cov, y_meas_bin, sg_win=9, sg_poly=3, ou
 # STEP 9  LSDI 与 7个常规植被指数的二分类混淆矩阵对比
 # =====================================================================
 
-BASE_VI = ['NDVI', 'GRNDVI', 'GDVI', 'MSAVI', 'ARVI', 'WDRVI', 'EVI']
+BASE_VI = ['NDVI', 'GRNDVI', 'GDVI', 'MSAVI', 'ARVI', 'WDRVI', 'EVI', 'PSRI', 'MINI']
 
 
 def _band_at(spec_mat, wl, target_nm):
@@ -851,9 +875,14 @@ def _band_at(spec_mat, wl, target_nm):
 
 
 def calc_base_vi(spec_mat, wl):
-    """7个常规植被指数（NDVI/GRNDVI/GDVI/MSAVI/ARVI/WDRVI/EVI），标准可见光-近红外波段"""
+    """绿植被指数加上 PSRI（衰老）和 MINI（盐沼非光合）。"""
     R, G, N, B = (_band_at(spec_mat, wl, 670), _band_at(spec_mat, wl, 560),
                   _band_at(spec_mat, wl, 860), _band_at(spec_mat, wl, 490))
+    r680 = _band_at(spec_mat, wl, 680)
+    r500 = _band_at(spec_mat, wl, 500)
+    r750 = _band_at(spec_mat, wl, 750)
+    r690 = _band_at(spec_mat, wl, 690)
+    r621 = _band_at(spec_mat, wl, 621)
     eps = 1e-10
     return {
         'NDVI':   (N - R) / (N + R + eps),
@@ -863,6 +892,8 @@ def calc_base_vi(spec_mat, wl):
         'ARVI':   (N - (2 * R - B)) / (N + (2 * R - B) + eps),
         'WDRVI':  (0.2 * N - R) / (0.2 * N + R + eps),
         'EVI':    2.5 * (N - R) / (N + 6 * R - 7.5 * B + 1 + eps),
+        'PSRI':   (r680 - r500) / (r750 + eps),
+        'MINI':   (r690 - r621) / (r690 + r621 + eps),
     }
 
 
@@ -973,8 +1004,9 @@ def step10_summary(lsdi_result, base_results, n_samples, out_dir=OUT_DIR):
         Patch(facecolor='#BDC3C7', edgecolor='none', label='Conventional VIs'),
     ]
     ax.legend(handles=legend_handles, fontsize=6.5, loc='upper right', handlelength=1.0, borderpad=0.5)
-    ax.text(0.02, 0.97, f'$n$ = {n_samples} field spectral\nBinary classification (≥60% vs. <60%)',
-            transform=ax.transAxes, fontsize=6, va='top', color='0.4', linespacing=1.4)
+    # 说明文字放在坐标区外侧上方
+    ax.text(0.02, 1.03, f'$n$ = {n_samples} field spectral   |   Binary classification (≥60% vs. <60%)',
+            transform=ax.transAxes, fontsize=6, va='bottom', ha='left', color='0.4')
     plt.tight_layout(pad=0.5)
     fig.savefig(out_dir / 'step10_rf_compare.png', dpi=400, bbox_inches='tight')
     plt.close()
@@ -1028,13 +1060,13 @@ def main():
         with open(SIM_EXPORT_PKL, 'wb') as f:
             pickle.dump({'sim_data': sim_data, 'WL': wl, 'ALL_COVERAGES': ALL_COVERAGES}, f)
 
-    # ---- STEP 3  精度筛选 R²≥0.95 ----
+    # ---- STEP 3  模拟光谱与实测均值 R²≥0.95 ----
     sim_data, acc_before, acc_after, filter_stats = step3_accuracy_filter(wl, measured_mean, sim_data)
 
     # ---- STEP 4  光谱响应（原始/一阶/二阶导数）----
     step4_spectral_response(wl, measured_mean, sim_data, sg_win=11, sg_poly=3)
 
-    # ---- STEP 5  SG滤波参数筛选 ----
+    # ---- STEP 5  SG窗口与多项式阶数 ----
     best_w, best_p = step5_sg_selection(wl, measured_mean[0])
 
     # ---- STEP 6  OAT局部敏感性分析 ----
